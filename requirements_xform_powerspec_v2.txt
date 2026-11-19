@@ -1,0 +1,154 @@
+REQUIREMENTS: POWER SPECTRUM ANALYSIS TAB  (v2)
+=================================================
+
+PURPOSE
+This document describes a power spectral analysis feature and how it is to be computed. It is written so that it can be dropped into the folder of any existing Python/tkinter program, and a developer (or Claude) can add the feature as a new tab without asking the user further questions. Where this document is silent, use sensible defaults and note them in the log; do not stop to ask.
+
+The transform used is a real-to-real sinusoidal orthonormal transform.
+
+
+-------------------------------------------------
+PART A. INTEGRATION INTO THE HOST PROGRAM
+-------------------------------------------------
+
+A1. Assumptions: the host program is Python with a tkinter (ttk) UI. numpy, scipy, pillow and matplotlib are installed and may be used (matplotlib via the TkAgg backend embedded in the tab, i.e. FigureCanvasTkAgg). No other third-party packages may be added.
+
+A2. First inspect the host program: find the main window, its entry point, and whether it already uses a ttk.Notebook (tab container).
+    - If a Notebook exists: add the new tab to it, titled "Power Spectrum".
+    - If none exists: create a ttk.Notebook in the main window, move the program's existing UI into a first tab (keep its original title, or "Main" if it has none), and add "Power Spectrum" as a second tab. Existing behavior, menus, key bindings and callbacks must keep working unchanged.
+
+A3. Put the new code in its own module (suggested name: powerspec_tab.py) exposing a class (e.g. PowerSpecTab(ttk.Frame)) so that the host file needs only a few lines changed (an import and the notebook.add call). Keep the DSP code (transform, windows, power spectrum, file loading) free of tkinter so that it can be tested on its own.
+
+A4. The tab has its own log window (a read-only scrolled Text widget at the bottom of the tab). ALL messages specific to this functionality go there; do not use pop-up message boxes or the host program's log for this tab's messages. Log lines are prefixed with a timestamp and a level: INFO or ERROR (errors may also be shown in red).
+    - ERROR examples: file cannot be opened, unsupported file type or WAV format, empty file, invalid parameter, row/column out of range.
+    - INFO examples: file loaded (name, type, samples, sampling frequency), channel/row/column selected, transform size or window changed, graph computed (block number or "average of M blocks"), spectrogram computed, file saved.
+    - A failure must never crash the program or leave the tab unusable; log the error and keep the previous state.
+
+A5. When done, run the host program once to confirm it starts and that the new tab appears, and run the acceptance tests in Part E.
+
+
+-------------------------------------------------
+PART B. THE TRANSFORM AND POWER SPECTRUM
+-------------------------------------------------
+
+B1. The transform is a real-to-real orthonormal transform defined by the square matrix Tmatrix below. When the transform is applied to data, the implementation MUST use an FFT for computational efficiency (e.g. numpy.fft.rfft), not a matrix multiply. (A matrix-multiply version may exist for testing only.)
+
+B2. The transform size N is user selected as a power of 2, from 2^4 to 2^14 (default 512). Tmatrix is N x N. Rows are indexed by k, columns by n (n = 0 .. N-1).
+
+B3. Row k = 0:  all values equal 1/sqrt(N).
+
+B4. Rows k = 1 .. N/2 - 1:  T[k][n] = sqrt(2/N) * cos(2*pi*k*n/N).
+
+B5. Row k = N/2:  T[k][n] = (1/sqrt(N)) * cos(pi*n)   (i.e. alternating +1/sqrt(N), -1/sqrt(N)).
+
+B6. Rows k = N/2 + 1 .. N-1:  T[k][n] = sqrt(2/N) * sin(2*pi*(N-k)*n/N).
+
+B7. Coefficients of a length-N block x are c = Tmatrix * x. Implementing this with an FFT: let X = rfft(x), then
+        c_0     = Re(X_0) / sqrt(N)
+        c_N/2   = Re(X_N/2) / sqrt(N)
+        c_k     = sqrt(2/N) * Re(X_k)       for k = 1 .. N/2 - 1
+        c_(N-k) = -sqrt(2/N) * Im(X_k)      for k = 1 .. N/2 - 1
+    The result must equal the matrix multiply to numerical precision.
+
+B8. Raw power spectrum of a length-N block (N/2 + 1 values, indexed k = 0 .. N/2):
+        P[0]    = c_0^2                          (DC)
+        P[N/2]  = c_N/2^2                        (Nyquist)
+        P[k]    = c_k^2 + c_(N-k)^2              for k = 1 .. N/2 - 1
+    (Equivalent via the FFT: P[k] = (2/N)*|X_k|^2 for 1 <= k <= N/2-1, P[0] = |X_0|^2/N, P[N/2] = |X_N/2|^2/N.)
+
+B9. Windowing. The user chooses a window: Rectangular (default), Hamming, or Hanning (Hann). Each block is multiplied by the window (length N) before the transform. Use the periodic ("DFT-even") form of the window, e.g. scipy.signal.get_window(name, N, fftbins=True) with names "boxcar", "hamming", "hann". To keep power levels comparable between windows, divide every power value by (sum(w^2)/N), so a rectangular window gives exactly the raw power spectrum of B8. Padding (B10) is done before windowing.
+
+B10. Blocking. The input data stream is divided into consecutive, non-overlapping blocks of N samples (hop = N). If the last block is short, pad it with zeros to length N. If the stream is shorter than N it forms a single zero-padded block. No mean removal is performed (the DC bin shows the mean). Number of blocks M = ceil(L/N), where L is the stream length.
+
+B11. Frequency axis. There are N/2 + 1 frequency bins, k = 0 .. N/2. Bin k is at frequency f_k = k * F_s / N, where F_s is the sampling frequency, so the bins span 0 to F_s/2.
+
+B12. Averaging. The averaged power spectrum is the mean over all M blocks (including the padded last block, and each block windowed) of the LINEAR power spectra, computed BEFORE any conversion to dB. Conversion to dB is the last step, after averaging. Never average dB values.
+
+
+-------------------------------------------------
+PART C. USER INTERFACE OF THE "POWER SPECTRUM" TAB
+-------------------------------------------------
+
+Suggested layout: controls in a panel at the top or left; the matplotlib plot filling the center; the log window across the bottom. Controls that do not apply to the current input or mode are disabled (greyed), not hidden.
+
+C1. INPUT FILE
+    a) "Browse..." button and a read-only field showing the chosen file's full path. The field wraps onto additional lines (breaking mid-word if necessary) whenever the path is too long, so that the ENTIRE path name is always visible; it follows the window width when resized. This applies to every file-selection field (input and output) in the host program as well as in this tab. Supported inputs: .wav audio files, and image files readable by Pillow (png, jpg/jpeg, bmp, gif, tif/tiff).
+    b) WAV files:
+        - Parse the header (PCM 8/16/24/32-bit integer, 32-bit float; WAVE_FORMAT_EXTENSIBLE accepted), strip it, and use the sample data. Convert samples to float scaled to the range -1.0 .. +1.0 (8-bit is unsigned, others signed).
+        - Channel selector: Left, Right, or Mono. Mono combines the channels as (L+R)/2. If the file has only one channel, the selector is disabled and that channel is used.
+        - The sampling frequency is read from the header and shown read-only (the user cannot edit it for .wav files).
+    c) Image files:
+        - Decompress to pixels and convert to grey scale (Pillow convert("L") or 0.299R + 0.587G + 0.114B), scaled to 0.0 .. 1.0.
+        - Selector for "Row" or "Column" plus an index (1-based, valid range 1 .. number of rows/columns, default 1). The selected row (left to right) or column (top to bottom) is the input data stream.
+        - The sampling frequency is user-editable (see C2).
+    d) Loading a file, or changing channel/row/column, resets the display to block 1 and recomputes, and logs the result.
+
+C2. PARAMETERS
+    a) Transform size N: drop-down of 16, 32, ... 16384 (default 512).
+    b) Sampling frequency F_s in Hz: numeric entry, default 1 Hz, must be > 0 (read-only and taken from the header for .wav).
+    c) Window: Rectangular (default), Hamming, Hanning.
+    d) Changing any parameter recomputes the current view and resets the block number to 1.
+
+C3. VIEW MODE (radio buttons): "Single block" (default), "Average of all blocks", "Spectrogram".
+
+C4. SINGLE BLOCK MODE
+    a) The user selects the block number, 1 .. M (M = number of blocks, shown as "of M"). Default 1. Out-of-range or non-numeric entries are rejected with an ERROR log message.
+    b) "Previous block" and "Next block" buttons step backward/forward through the stream, redrawing the spectrum each time. They are disabled at the first/last block respectively, and are disabled in the other two view modes.
+
+C5. AVERAGE MODE
+    Shows the average power spectrum of every block in the stream, per B12. The block selector and Previous/Next buttons are disabled.
+
+C6. SCALE (applies to graph modes): radio buttons "Linear" and "dB" (default dB).
+    a) Linear: y-axis is power (linear units, label "Power").
+    b) dB: find P_max, the maximum power over all N/2+1 bins of the spectrum being displayed (the single block, or the averaged spectrum). Plot 10*log10(P / P_max), so the largest value is 0 dB.
+    c) Floor: a numeric entry/spinbox, default -40 dB, range -200 .. 0 dB. Every dB value below the floor, including zero-power bins (log of 0), is clipped to the floor value. If P_max = 0 (all-zero data), plot everything at the floor and log an INFO message.
+    d) The floor control is enabled only when dB is selected or when in Spectrogram mode.
+
+C7. AXES FOR GRAPHS
+    a) FREQUENCY RANGE (applies to the single-block spectrum, the averaged spectrum and the spectrogram): the default displayed frequency range is 0 to F_s/2 (half the sampling frequency). The user may instead enter a lower frequency and an upper frequency ("Lower freq (Hz)" and "Upper freq (Hz)" numeric entries, always enabled). Valid values satisfy 0 <= lower < upper <= F_s/2; an invalid entry is rejected with an ERROR log message and the previous range is kept. Applying a valid range redraws the current view (display range only; the computed data is unchanged) and logs an INFO message. The range is reset to 0 .. F_s/2 whenever a file is loaded or F_s is changed. The range applies to the frequency axis: x-axis for the spectrum graphs, y-axis for the spectrogram.
+    b) x-axis (spectrum graphs): frequency in Hz, computed per B11 (k*F_s/N), shown over the range of C7a. y-axis: "Power (dB re max)" or "Power" for linear. Title shows file name, mode, N and window (and the block number for single block mode). Include the matplotlib navigation toolbar (zoom/pan/save).
+
+C8. SPECTROGRAM MODE
+    a) Transform every block (padded and windowed per B9/B10), compute each block's raw power spectrum, and assemble an (N/2+1) x M array of linear power values.
+    b) Find the largest value in the entire array, P_max, and plot 10*log10(P/P_max), i.e. normalized to 0 dB. Apply the floor (C6c) to values below it, including zeros.
+    c) Colors: linear gradient from pure blue (0,0,255) at the lowest value (the floor) to pure red (255,0,0) at the highest value (0 dB), i.e. a matplotlib LinearSegmentedColormap from "blue" to "red". Show a colorbar labeled in dB. Use imshow/pcolormesh with the origin at the bottom so frequency increases upward.
+    d) y-axis: frequency in Hz (0 to F_s/2), per B11. x-axis: block number (1 .. M) for image inputs; for .wav audio, x-axis is time in seconds, where block j is plotted at its start time (j-1)*N/F_s.
+    e) For a very large number of blocks, the display may be decimated for drawing, but the computed data must not be.
+    f) The frequency range of the spectrogram's y-axis is set per C7a.
+
+C9. SAVING
+    a) The tab has a "Save PNG..." button. It saves the currently displayed plot (single-block spectrum, averaged spectrum, or spectrogram, exactly as shown, including title, axis labels and colorbar) as a .png file.
+    b) Clicking the button always opens a file-save dialog (tkinter.filedialog.asksaveasfilename) so the user selects the output file. Default extension ".png", file type filter "PNG image (*.png)", and a suggested name built from the input file name and view, e.g. "<input>_block3.png", "<input>_average.png" or "<input>_spectrogram.png". A name without the .png extension gets it appended.
+    c) The image is written with matplotlib's figure.savefig(path, dpi=150) (or the same dpi as the on-screen figure if larger).
+    d) If the user cancels the dialog, nothing is saved and an INFO message "save cancelled" is logged. On success log INFO "file saved: <full path>". On failure (e.g. permission denied, invalid path) log an ERROR message with the reason and leave the tab usable.
+    e) The button is disabled when there is nothing to save (no input file loaded yet).
+    f) The matplotlib navigation toolbar's own Save button may remain, but the "Save PNG..." button is the supported way and the one that must log.
+
+
+-------------------------------------------------
+PART D. NON-FUNCTIONAL REQUIREMENTS
+-------------------------------------------------
+
+D1. Responsiveness. Computation of a full spectrogram for files of up to several minutes of audio should use vectorized numpy (reshape the padded stream to M x N and call rfft on axis 1) so the UI is not blocked for noticeable time. Files beyond a reasonable size (> 100 million samples) are rejected with an ERROR log message.
+D2. State. Switching tabs must not lose the Power Spectrum tab's state.
+D3. Code quality. Keep DSP functions pure (arrays in, arrays out) and documented with a one-line docstring. No global mutable state other than the tab's own object.
+
+
+-------------------------------------------------
+PART E. ACCEPTANCE TESTS (run after implementation)
+-------------------------------------------------
+
+Put these in a separate test file (e.g. test_powerspec.py) using plain asserts; they require no GUI.
+E1. For N = 16, 64, 512: Tmatrix built from B3-B6 satisfies T @ T.T = identity (tolerance 1e-9).
+E2. For random data, the FFT implementation (B7) equals T @ x to 1e-9 for every N from 16 to 4096.
+E3. Parseval: for a rectangular window, sum of P[0..N/2] of a block equals sum(x^2) of that block (tolerance 1e-9).
+E4. A pure cosine at exactly bin k0 (x[n] = cos(2*pi*k0*n/N)) puts all its power in bin k0; a sine does too.
+E5. A 1 kHz sine in a 44.1 kHz sampled stream, N = 1024: peak bin frequency is within one bin width (about 43 Hz) of 1000 Hz.
+E6. A signal whose length is not a multiple of N yields M = ceil(L/N) blocks, with the last zero-padded.
+E7. For a rectangular window the windowed result equals the raw result; for Hamming and Hanning the total power of a constant-amplitude (DC) input is within a few percent of the rectangular result after the sum(w^2)/N normalization is applied.
+E8. Average mode: averaging then converting to dB differs from converting then averaging; the implementation must match the former.
+E9. dB scale: the maximum is exactly 0 dB, and no value is below the floor; zero-power bins equal the floor.
+E10. Saving (code-level test, with the file dialog bypassed by passing a path): saving a single-block, averaged, and spectrogram figure each produces a non-empty file starting with the PNG signature (89 50 4E 47), and a bad path logs an ERROR without raising.
+E11. Defaults on opening the tab: N = 512, F_s = 1 Hz, window = Rectangular, floor = -40 dB, scale = dB, mode = Single block, block = 1, frequency range = 0 .. F_s/2 (0 .. 0.5 Hz).
+E12. Frequency range: after loading a file with F_s = 16000 Hz the range is 0 .. 8000. Setting 500 .. 3000 gives a spectrogram y-limit of (500, 3000) and a single-block/average x-limit of (500, 3000). Invalid ranges (lower >= upper, negative lower, upper > F_s/2, non-numeric) log an ERROR and leave the range unchanged.
+E13. File path fields wrap: a very long path set into a file field is displayed with a wraplength that tracks the field width, and the field is taller than one line.
